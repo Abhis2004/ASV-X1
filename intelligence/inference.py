@@ -1,10 +1,9 @@
 from ultralytics import YOLO
 import cv2
 
-video_path = r"C:\Users\araj8\Downloads\follow.mp4"
+video_path = r"C:\Users\araj8\Music\datasets\inference\Drone_Following_generated.mp4"
 
-model = YOLO(r"C:\Users\araj8\Music\ASV-X1\intelligence\train\models\trained_drone_viz.pt")
-#model = YOLO(r"C:\Users\araj8\Music\ASV-X1\intelligence\train\yolo26n.pt")
+model = YOLO(r"C:\Users\araj8\Music\ASV-X1\intelligence\train\models\asv_model.pt")
 
 
 selected_id = None
@@ -74,15 +73,15 @@ def track(video_path):
 
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
-                # cv2.putText(
-                #     frame,
-                #     label,
-                #     (x1, y1 - 10),
-                #     cv2.FONT_HERSHEY_SIMPLEX,
-                #     0.6,
-                #     color,
-                #     2
-                # )
+                cv2.putText(
+                    frame,
+                    label,
+                    (x1, y1 - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    color,
+                    2
+                )
 
         cv2.imshow("ByteTrack Tracking", frame)
 

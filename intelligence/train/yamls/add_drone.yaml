@@ -1,0 +1,18 @@
+train: C:/Users/araj8/Music/datasets/drone_dataset/train/images
+val: C:/Users/araj8/Music/datasets/drone_dataset/val/images
+# test: C:/Users/araj8/Music/datasets/drone_dataset/test/images   
+
+nc: 11
+
+names:
+  0: pedestrian
+  1: people
+  2: bicycle
+  3: car
+  4: van
+  5: truck
+  6: tricycle
+  7: awning-tricycle
+  8: bus
+  9: motor
+  10: drone
