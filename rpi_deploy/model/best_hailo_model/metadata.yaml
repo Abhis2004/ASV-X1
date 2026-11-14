@@ -1,0 +1,10 @@
+description: ASV-X1 VisDrone + UAVDT Drone Tracking Model
+author: ASV-X1
+task: detect
+names:
+  0: person
+  1: vehicle
+imgsz:
+  - 640
+  - 640
+channels: 3

@@ -1,0 +1,23 @@
+[Unit]
+Description=ASV-X1 Autonomous Drone Tracking & MAVLink Router Service
+After=network.target network-online.target NetworkManager.service
+Wants=network-online.target NetworkManager.service
+
+[Service]
+Type=simple
+User=asv
+Group=asv
+SupplementaryGroups=dialout video
+WorkingDirectory=/home/asv/Desktop/rpi_deploy
+Environment=HOME=/home/asv
+Environment=PYTHONPATH=/home/asv/.local/lib/python3.13/site-packages
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /home/asv/Desktop/rpi_deploy/main.py --headless --mav-baud 115200 --mav-port /dev/ttyUSB0
+Restart=on-failure
+RestartSec=3
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

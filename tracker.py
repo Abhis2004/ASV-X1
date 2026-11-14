@@ -2,6 +2,55 @@ import numpy as np
 import cv2
 from scipy.optimize import linear_sum_assignment
 import scipy.linalg
+from collections import deque
+
+
+class AppearanceExtractor:
+    """Lightweight spatial HSV histogram extractor for object re-identification."""
+    def __init__(self, crop_size=(64, 64), h_bins=16, s_bins=8, grid=2):
+        self.crop_size = crop_size
+        self.h_bins = h_bins
+        self.s_bins = s_bins
+        self.grid = grid
+        self.feature_dim = grid * grid * (h_bins + s_bins)
+
+    def extract(self, frame, bbox):
+        if frame is None:
+            return np.zeros(self.feature_dim, dtype=np.float32)
+            
+        x1, y1, x2, y2 = map(int, bbox)
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
+
+        if x2 - x1 < 10 or y2 - y1 < 10:
+            return np.zeros(self.feature_dim, dtype=np.float32)
+
+        crop = frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            return np.zeros(self.feature_dim, dtype=np.float32)
+            
+        crop = cv2.resize(crop, self.crop_size)
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+
+        h, w = self.crop_size
+        cell_h, cell_w = h // self.grid, w // self.grid
+
+        features = []
+        for i in range(self.grid):
+            for j in range(self.grid):
+                cell = hsv[i*cell_h:(i+1)*cell_h, j*cell_w:(j+1)*cell_w]
+                hist_h = cv2.calcHist([cell], [0], None, [self.h_bins], [0, 180])
+                hist_s = cv2.calcHist([cell], [1], None, [self.s_bins], [0, 256])
+                cv2.normalize(hist_h, hist_h)
+                cv2.normalize(hist_s, hist_s)
+                features.append(hist_h.flatten())
+                features.append(hist_s.flatten())
+
+        feature_vec = np.concatenate(features)
+        norm = np.linalg.norm(feature_vec)
+        if norm > 0:
+            feature_vec = feature_vec / norm
+        return feature_vec
 
 
 class KalmanFilter:
@@ -161,7 +210,7 @@ class CameraMotionCompensation:
                 if len(track.history) > 0:
                     hist_arr = np.array(track.history)
                     warped_hist = np.dot(hist_arr, R.T) + t
-                    track.history = [tuple(p) for p in warped_hist]
+                    track.history = deque([tuple(p) for p in warped_hist], maxlen=track.max_history)
 
         self.prev_frame = gray
 
@@ -218,6 +267,48 @@ def calculate_diou_matrix(boxes1, boxes2):
     return cost
 
 
+def calculate_appearance_cost(tracks, det_features, det_boxes):
+    """
+    Calculates cost matrix using Cosine similarity of Appearance features and direction gating.
+    """
+    if len(tracks) == 0 or len(det_features) == 0:
+        return np.empty((len(tracks), len(det_features)))
+    
+    cost_matrix = np.zeros((len(tracks), len(det_features)), dtype=np.float32)
+    for i, track in enumerate(tracks):
+        for j, (det_feat, det_box) in enumerate(zip(det_features, det_boxes)):
+            if track.appearance is None or det_feat is None or np.sum(det_feat) == 0:
+                cost_matrix[i, j] = 1.0
+                continue
+            
+            # 1. Cosine distance
+            cos_sim = np.dot(track.appearance, det_feat)
+            app_cost = 1.0 - cos_sim
+            
+            # 2. Direction-Aware Gating penalty
+            last_cx, last_cy = track.last_confirmed_position
+            vx, vy = track.last_confirmed_velocity
+            
+            det_cx = (det_box[0] + det_box[2]) / 2.0
+            det_cy = (det_box[1] + det_box[3]) / 2.0
+            
+            dx = det_cx - last_cx
+            dy = det_cy - last_cy
+            
+            # If track had significant velocity, check if det is in same direction
+            v_norm = np.hypot(vx, vy)
+            d_norm = np.hypot(dx, dy)
+            
+            if v_norm > 2.0 and d_norm > 10.0:
+                cos_dir = (vx*dx + vy*dy) / (v_norm * d_norm + 1e-6)
+                if cos_dir < 0: # Moving opposite direction
+                    app_cost += 0.3 * abs(cos_dir)
+                    
+            cost_matrix[i, j] = app_cost
+            
+    return cost_matrix
+
+
 class TrackState:
     Tentative = 1
     Confirmed = 2
@@ -231,7 +322,7 @@ class Track:
     """
     _id_counter = 1
 
-    def __init__(self, mean, covariance, cls_id, conf, max_history=30):
+    def __init__(self, mean, covariance, cls_id, conf, max_history=30, feature=None):
         self.track_id = Track._id_counter
         Track._id_counter += 1
 
@@ -245,8 +336,14 @@ class Track:
         self.time_since_update = 0
         self.state = TrackState.Tentative
 
-        self.history = []
         self.max_history = max_history
+        self.history = deque(maxlen=max_history)
+
+        # Stage 4 Re-ID Extensions
+        self.appearance = feature
+        self.confirmed_frames = 0
+        self.last_confirmed_position = (mean[0], mean[1])
+        self.last_confirmed_velocity = (0.0, 0.0)
 
         # Record center
         cx, cy = mean[0], mean[1]
@@ -270,10 +367,20 @@ class Track:
 
         cx, cy = self.mean[0], self.mean[1]
         self.history.append((cx, cy))
-        if len(self.history) > self.max_history:
-            self.history.pop(0)
 
-    def update(self, kf, detection):
+    def update_appearance(self, new_feature, momentum=0.85):
+        """EMA update for appearance robust to short-term variations."""
+        if new_feature is None or np.sum(new_feature) == 0:
+            return
+        if self.appearance is None:
+            self.appearance = new_feature
+        else:
+            self.appearance = momentum * self.appearance + (1.0 - momentum) * new_feature
+            norm = np.linalg.norm(self.appearance)
+            if norm > 0:
+                self.appearance = self.appearance / norm
+
+    def update(self, kf, detection, feature=None):
         """Update Kalman state with matched detection [x1, y1, x2, y2, conf, cls]."""
         x1, y1, x2, y2, conf, cls_id = detection
         w = max(1.0, x2 - x1)
@@ -282,6 +389,13 @@ class Track:
         cy = y1 + h / 2.0
         a = w / h
 
+        # Stage 4 Update Extensions: Compute velocity & log last confirmed pos
+        vx = cx - self.last_confirmed_position[0]
+        vy = cy - self.last_confirmed_position[1]
+        self.last_confirmed_velocity = (vx, vy)
+        self.last_confirmed_position = (cx, cy)
+        self.confirmed_frames += 1
+
         measurement = np.array([cx, cy, a, h])
         self.mean, self.covariance = kf.update(self.mean, self.covariance, measurement)
 
@@ -289,15 +403,27 @@ class Track:
         self.time_since_update = 0
         self.conf = float(conf)
         self.cls = int(cls_id)
+        
+        if feature is not None:
+            self.update_appearance(feature)
 
         if self.state == TrackState.Tentative and self.hits >= 2:
             self.state = TrackState.Confirmed
 
-    def mark_missed(self, max_age):
-        """Handle unmatched frame."""
+    def mark_missed(self, base_max_age):
+        """Handle unmatched frame with adaptive track lifetime."""
         if self.state == TrackState.Tentative:
             self.state = TrackState.Deleted
-        elif self.time_since_update > max_age:
+            return
+            
+        # Adaptive max age logic
+        adaptive_max_age = base_max_age
+        if self.confirmed_frames > 15 and self.appearance is not None:
+            adaptive_max_age = int(base_max_age * 2.5)
+        elif self.confirmed_frames > 5:
+            adaptive_max_age = int(base_max_age * 1.5)
+            
+        if self.time_since_update > adaptive_max_age:
             self.state = TrackState.Deleted
         else:
             self.state = TrackState.Lost
@@ -320,6 +446,7 @@ class DroneTracker:
       - Scaled-variance Kalman Filtering
       - ByteTrack-style two-stage confidence association
       - DIoU (Distance IoU) matching cost
+      - Stage 4 Appearance-Based Re-ID (Handles long-term bridge/tunnel occlusions)
     """
 
     def __init__(
@@ -330,6 +457,8 @@ class DroneTracker:
         max_age=30,
         min_hits=2,
         use_gmc=True,
+        reid_thresh=0.45,
+        long_lost_frames=8
     ):
         self.det_thresh = det_thresh
         self.low_thresh = low_thresh
@@ -337,39 +466,53 @@ class DroneTracker:
         self.max_age = max_age
         self.min_hits = min_hits
         self.use_gmc = use_gmc
+        self.reid_thresh = reid_thresh
+        self.long_lost_frames = long_lost_frames
 
         self.kf = KalmanFilter()
         self.gmc = CameraMotionCompensation() if use_gmc else None
+        self.app_extractor = AppearanceExtractor()
         self.tracks = []
 
     def update(self, detections, frame=None):
         """
         Update tracker with new frame detections.
         detections: np.ndarray or list of [x1, y1, x2, y2, conf, cls]
-        frame: BGR numpy image frame (optional, required if GMC is enabled)
+        frame: BGR numpy image frame (optional, required if GMC is enabled or Appearance Re-ID)
         Returns: list of active confirmed/lost Track objects
         """
         if len(detections) == 0:
             detections = np.empty((0, 6))
         else:
             detections = np.array(detections, dtype=np.float32)
+            
+        # 1. Extract appearance features for all detections
+        det_features = []
+        if frame is not None and len(detections) > 0:
+            for det in detections:
+                feat = self.app_extractor.extract(frame, det[:4])
+                det_features.append(feat)
+        else:
+            det_features = [None] * len(detections)
 
-        # 1. Camera Motion Compensation
+        # 2. Camera Motion Compensation
         if self.gmc is not None and frame is not None:
             self.gmc.apply(frame, self.tracks)
 
-        # 2. Predict all track states via Kalman Filter
+        # 3. Predict all track states via Kalman Filter
         for track in self.tracks:
             track.predict(self.kf)
 
-        # 3. Split detections into high confidence & low confidence
+        # 4. Split detections into high confidence & low confidence
         high_mask = detections[:, 4] >= self.det_thresh
         low_mask = (detections[:, 4] >= self.low_thresh) & (~high_mask)
 
         dets_high = detections[high_mask]
         dets_low = detections[low_mask]
+        
+        feats_high = [det_features[i] for i in range(len(detections)) if high_mask[i]]
+        feats_low = [det_features[i] for i in range(len(detections)) if low_mask[i]]
 
-        # Separate tracks into confirmed and unconfirmed/lost
         confirmed_tracks = [t for t in self.tracks if t.is_confirmed()]
         unconfirmed_tracks = [t for t in self.tracks if t.is_tentative() or t.is_lost()]
 
@@ -386,7 +529,7 @@ class DroneTracker:
         )
 
         for trk_idx, det_idx in matches_a:
-            confirmed_tracks[trk_idx].update(self.kf, dets_high[det_idx])
+            confirmed_tracks[trk_idx].update(self.kf, dets_high[det_idx], feats_high[det_idx])
 
         # ----------------------------------------------------
         # Second Association: Remaining confirmed tracks <-> Low-conf detections
@@ -402,36 +545,82 @@ class DroneTracker:
         )
 
         for trk_idx, det_idx in matches_b:
-            remain_confirmed[trk_idx].update(self.kf, dets_low[det_idx])
+            remain_confirmed[trk_idx].update(self.kf, dets_low[det_idx], feats_low[det_idx])
 
         # Mark confirmed tracks that missed both associations
         for trk_idx in unassigned_tracks_b:
             remain_confirmed[trk_idx].mark_missed(self.max_age)
 
         # ----------------------------------------------------
-        # Third Association: Unassigned high-conf detections <-> Unconfirmed/Lost tracks
+        # Third Association: Unassigned high-conf detections <-> Recently Lost / Tentative tracks
         # ----------------------------------------------------
         remain_dets_high = [dets_high[i] for i in unassigned_dets_high]
+        remain_feats_high = [feats_high[i] for i in unassigned_dets_high]
         remain_dets_high_boxes = [d[:4] for d in remain_dets_high]
-        unconfirmed_boxes = [t.to_tlbr() for t in unconfirmed_tracks]
+        
+        # Filter unconfirmed tracks: Stage 3 handles recent occlusion or tentative
+        stage3_tracks = [t for t in unconfirmed_tracks if t.is_tentative() or (t.is_lost() and t.time_since_update < self.long_lost_frames)]
+        # Filter unconfirmed tracks: Stage 4 handles long-term occlusion
+        stage4_tracks = [t for t in unconfirmed_tracks if t.is_lost() and t.time_since_update >= self.long_lost_frames and t.appearance is not None]
+        other_unconfirmed = [t for t in unconfirmed_tracks if t not in stage3_tracks and t not in stage4_tracks]
 
-        cost_matrix_unconf = calculate_diou_matrix(unconfirmed_boxes, remain_dets_high_boxes)
+        stage3_boxes = [t.to_tlbr() for t in stage3_tracks]
+        cost_matrix_unconf = calculate_diou_matrix(stage3_boxes, remain_dets_high_boxes)
 
         matches_c, unassigned_tracks_c, unassigned_dets_c = self._linear_assignment(
-            cost_matrix_unconf, 0.70, unconfirmed_tracks, remain_dets_high
+            cost_matrix_unconf, 0.70, stage3_tracks, remain_dets_high
         )
 
         for trk_idx, det_idx in matches_c:
-            unconfirmed_tracks[trk_idx].update(self.kf, remain_dets_high[det_idx])
+            stage3_tracks[trk_idx].update(self.kf, remain_dets_high[det_idx], remain_feats_high[det_idx])
 
         for trk_idx in unassigned_tracks_c:
-            unconfirmed_tracks[trk_idx].mark_missed(self.max_age)
+            stage3_tracks[trk_idx].mark_missed(self.max_age)
+            
+        # ----------------------------------------------------
+        # Fourth Association (NEW): Long-lost tracks <-> Remaining high-conf detections (Appearance Re-ID)
+        # ----------------------------------------------------
+        remain_dets_stage4 = [remain_dets_high[i] for i in unassigned_dets_c]
+        remain_feats_stage4 = [remain_feats_high[i] for i in unassigned_dets_c]
+        remain_dets_stage4_boxes = [d[:4] for d in remain_dets_stage4]
+        
+        if len(stage4_tracks) > 0 and len(remain_dets_stage4) > 0:
+            cost_matrix_reid = calculate_appearance_cost(stage4_tracks, remain_feats_stage4, remain_dets_stage4_boxes)
+            
+            # Additional Class Gating for Stage 4
+            for i, track in enumerate(stage4_tracks):
+                for j, det in enumerate(remain_dets_stage4):
+                    if track.cls != int(det[5]):  # Class mismatch prevents re-ID match
+                        cost_matrix_reid[i, j] = 1.0
+                        
+            matches_d, unassigned_tracks_d, unassigned_dets_d = self._linear_assignment(
+                cost_matrix_reid, self.reid_thresh, stage4_tracks, remain_dets_stage4
+            )
+            
+            for trk_idx, det_idx in matches_d:
+                # Re-confirm the long lost track successfully via Re-ID!
+                stage4_tracks[trk_idx].update(self.kf, remain_dets_stage4[det_idx], remain_feats_stage4[det_idx])
+                stage4_tracks[trk_idx].state = TrackState.Confirmed
+                
+            for trk_idx in unassigned_tracks_d:
+                stage4_tracks[trk_idx].mark_missed(self.max_age)
+                
+            unassigned_dets_final = [unassigned_dets_c[i] for i in unassigned_dets_d]
+        else:
+            for trk in stage4_tracks:
+                trk.mark_missed(self.max_age)
+            unassigned_dets_final = unassigned_dets_c
+            
+        # Ensure tracks that don't fit stage 3 or 4 get processed (should just hit max_age)
+        for trk in other_unconfirmed:
+            trk.mark_missed(self.max_age)
 
         # ----------------------------------------------------
         # Create new tracks for remaining unmatched high-conf detections
         # ----------------------------------------------------
-        for det_idx in unassigned_dets_c:
+        for det_idx in unassigned_dets_final:
             det = remain_dets_high[det_idx]
+            feat = remain_feats_high[det_idx]
             x1, y1, x2, y2, conf, cls_id = det
             w = max(1.0, x2 - x1)
             h = max(1.0, y2 - y1)
@@ -441,7 +630,7 @@ class DroneTracker:
 
             measurement = np.array([cx, cy, a, h])
             mean, covariance = self.kf.initiate(measurement)
-            new_track = Track(mean, covariance, cls_id, conf)
+            new_track = Track(mean, covariance, cls_id, conf, feature=feat)
             if self.min_hits <= 1:
                 new_track.state = TrackState.Confirmed
             self.tracks.append(new_track)
